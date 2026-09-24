@@ -14,6 +14,8 @@ from google.protobuf.message import Message
 from Crypto.Cipher import AES
 import base64
 import random
+from pathlib import Path
+import os
 
 # === Settings ===
 MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
@@ -21,6 +23,9 @@ MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
 RELEASEVERSION = "OB55"
 USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
 SUPPORTED_REGIONS = {"IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID", "TW", "VN", "TH", "ME", "PK", "CIS", "BD", "EUROPE"}
+REGION_ALIASES = {"EU": "EUROPE", "EUROPE": "EUROPE", "IN": "IND", "INDIA": "IND", "BRAZIL": "BR", "BANGLADESH": "BD", "PAKISTAN": "PK", "VIETNAM": "VN", "THAILAND": "TH", "INDONESIA": "ID", "SINGAPORE": "SG", "TAIWAN": "TW", "MIDDLEEAST": "ME"}
+HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=25.0, write=10.0, pool=10.0)
+HTTP_RETRIES = 2
 
 # === Flask App Setup ===
 app = Flask(__name__)
@@ -47,7 +52,7 @@ async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
     return proto_message.SerializeToString()
 
 def get_account_credentials(region: str) -> str:
-    r = region.upper()
+    r = REGION_ALIASES.get(region.upper(), region.upper())
     if r == "IND":
         return "uid=6057084560&password=38E530C925EEC2ED2CE12EFDD050E3ECC4CF0B28B1CBEC77B24DF0EA4C669992"
     elif r in {"BR", "US", "SAC", "NA"}:
@@ -66,7 +71,8 @@ def get_account_credentials(region: str) -> str:
         return "uid=3692312456&password=1A062FD700DA8F826AF84A37EE2B62121B79516AF71666949C72FFF42D1C554A"
     else:
         try:
-            with open("accounts.txt", "r") as f:
+            accounts_path = Path(__file__).resolve().parent / "accounts.txt"
+            with accounts_path.open("r", encoding="utf-8") as f:
                 lines = [line.strip() for line in f if line.strip()]
                 if not lines:
                     raise ValueError("File accounts.txt trống.")
@@ -76,17 +82,39 @@ def get_account_credentials(region: str) -> str:
             return f"ERROR: {e}"
 
 # === Token Generation ===
+async def http_post(url: str, *, data=None, headers=None, json_data=None):
+    last_error = None
+    for attempt in range(HTTP_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
+                resp = await client.post(url, data=data, headers=headers, json=json_data)
+                resp.raise_for_status()
+                return resp
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+            last_error = exc
+            if attempt < HTTP_RETRIES:
+                await asyncio.sleep(0.8 * (attempt + 1))
+            else:
+                raise
+    raise last_error
+
 async def get_access_token(account: str):
     url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
     payload = account + "&response_type=token&client_type=2&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3&client_id=100067"
     headers = {'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/x-www-form-urlencoded"}
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, data=payload, headers=headers)
-        data = resp.json()
-        return data.get("access_token", "0"), data.get("open_id", "0")
+    resp = await http_post(url, data=payload, headers=headers)
+    data = resp.json()
+    token = data.get("access_token")
+    open_id = data.get("open_id")
+    if not token or not open_id:
+        raise ValueError("Token service response is missing access_token/open_id")
+    return token, open_id
 
 async def create_jwt(region: str):
+    region = REGION_ALIASES.get(region.upper(), region.upper())
     account = get_account_credentials(region)
+    if account.startswith("ERROR:"):
+        raise RuntimeError("No account credentials configured for this region")
     token_val, open_id = await get_access_token(account)
     body = json.dumps({"open_id": open_id, "open_id_type": "4", "login_token": token_val, "orign_platform_type": "4"})
     proto_bytes = await json_to_proto(body, FreeFire_pb2.LoginReq())
@@ -95,19 +123,26 @@ async def create_jwt(region: str):
     headers = {'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
                'Content-Type': "application/octet-stream", 'Expect': "100-continue", 'X-Unity-Version': "2018.4.11f1",
                'X-GA': "v1 1", 'ReleaseVersion': RELEASEVERSION}
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(url, data=payload, headers=headers)
-        msg = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, FreeFire_pb2.LoginRes)))
-        cached_tokens[region] = {
-            'token': f"Bearer {msg.get('token','0')}",
-            'region': msg.get('lockRegion','0'),
-            'server_url': msg.get('serverUrl','0'),
-            'expires_at': time.time() + 25200
-        }
+    resp = await http_post(url, data=payload, headers=headers)
+    msg = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, FreeFire_pb2.LoginRes)))
+    cached_tokens[region] = {
+        'token': f"Bearer {msg.get('token','0')}",
+        'region': msg.get('lockRegion','0'),
+        'server_url': msg.get('serverUrl','0'),
+        'expires_at': time.time() + 25200
+    }
 
 async def initialize_tokens():
-    tasks = [create_jwt(r) for r in SUPPORTED_REGIONS]
-    await asyncio.gather(*tasks)
+    results = {}
+    tasks = {r: asyncio.create_task(create_jwt(r)) for r in SUPPORTED_REGIONS}
+    for region, task in tasks.items():
+        try:
+            await task
+            results[region] = "ok"
+        except Exception as exc:
+            app.logger.warning("Token initialization failed for %s: %s", region, exc)
+            results[region] = "failed"
+    return results
 
 async def refresh_tokens_periodically():
     while True:
@@ -123,7 +158,7 @@ async def get_token_info(region: str) -> Tuple[str,str,str]:
     return info['token'], info['region'], info['server_url']
 
 async def GetAccountInformation(uid, unk, region, endpoint):
-    region = region.upper()
+    region = REGION_ALIASES.get(region.upper(), region.upper())
     if region not in SUPPORTED_REGIONS:
         raise ValueError(f"Unsupported region: {region}")
     payload = await json_to_proto(json.dumps({'a': uid, 'b': unk}), main_pb2.GetPlayerPersonalShow())
@@ -133,8 +168,11 @@ async def GetAccountInformation(uid, unk, region, endpoint):
                'Content-Type': "application/octet-stream", 'Expect': "100-continue",
                'Authorization': token, 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1",
                'ReleaseVersion': RELEASEVERSION}
-    async with httpx.AsyncClient() as client:
+    if not server or server == "0":
+        raise RuntimeError("Login response did not include a profile server URL")
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         resp = await client.post(server+endpoint, data=data_enc, headers=headers)
+        resp.raise_for_status()
         return json.loads(json_format.MessageToJson(decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
 
 # === Caching Decorator ===
@@ -152,6 +190,15 @@ def cached_endpoint(ttl=300):
     return decorator
 
 # === Flask Routes ===
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "ok",
+        "release_version": RELEASEVERSION,
+        "supported_regions": sorted(SUPPORTED_REGIONS),
+        "cached_regions": sorted(cached_tokens.keys())
+    }), 200
+
 @app.route('/player-info')
 @cached_endpoint()
 def get_account_info():
@@ -175,10 +222,14 @@ def get_account_info():
 
     except Exception as e:
         # Agar koi error aaye toh yeh catch karega
-        return jsonify({"error": "Invalid UID or Region. Please check and try again."}), 500
+        app.logger.exception("Player-info request failed")
+        return jsonify({"error": "Player info request failed. Check UID, region, credentials, and upstream availability."}), 502
 
 @app.route('/refresh', methods=['GET','POST'])
 def refresh_tokens_endpoint():
+    refresh_secret = os.getenv('REFRESH_SECRET')
+    if refresh_secret and request.headers.get('X-Refresh-Secret') != refresh_secret:
+        return jsonify({'error': 'Unauthorized'}), 401
     try:
         asyncio.run(initialize_tokens())
         return jsonify({'message':'Tokens refreshed for all regions.'}),200
@@ -191,5 +242,4 @@ async def startup():
     asyncio.create_task(refresh_tokens_periodically())
 
 if __name__ == '__main__':
-    asyncio.run(startup())
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '5000')), debug=False)
