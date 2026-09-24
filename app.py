@@ -26,6 +26,9 @@ SUPPORTED_REGIONS = {"IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID", "TW", "VN
 REGION_ALIASES = {"EU": "EUROPE", "EUROPE": "EUROPE", "IN": "IND", "INDIA": "IND", "BRAZIL": "BR", "BANGLADESH": "BD", "PAKISTAN": "PK", "VIETNAM": "VN", "THAILAND": "TH", "INDONESIA": "ID", "SINGAPORE": "SG", "TAIWAN": "TW", "MIDDLEEAST": "ME"}
 HTTP_TIMEOUT = httpx.Timeout(30.0, connect=10.0, read=25.0, write=10.0, pool=10.0)
 HTTP_RETRIES = 2
+# Optional profile API base URL override. Leave unset to use the serverUrl returned by MajorLogin.
+# NOTE: client.ind.freefiremobile.com is a client domain and is NOT used automatically as a player-info API.
+PROFILE_SERVER_BASE_URL = os.getenv("PROFILE_SERVER_BASE_URL", "").strip().rstrip("/")
 
 # === Flask App Setup ===
 app = Flask(__name__)
@@ -54,7 +57,7 @@ async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
 def get_account_credentials(region: str) -> str:
     r = REGION_ALIASES.get(region.upper(), region.upper())
     if r == "IND":
-        return "uid=7912762399&password=4929F55AFD0004A58A24F64DEE992505F6C27D9A016DE8047B2E534C23121BD3"
+        return "uid=6057084560&password=38E530C925EEC2ED2CE12EFDD050E3ECC4CF0B28B1CBEC77B24DF0EA4C669992"
     elif r in {"BR", "US", "SAC", "NA"}:
         return "uid=3692292847&password=FC22F6812C850FF7D8DB8C5474A106B6FE22CB10C0A6673837216A32675E5649"
     elif r == "VN":
@@ -168,11 +171,16 @@ async def GetAccountInformation(uid, unk, region, endpoint):
                'Content-Type': "application/octet-stream", 'Expect': "100-continue",
                'Authorization': token, 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1",
                'ReleaseVersion': RELEASEVERSION}
-    if not server or server == "0":
+    base_url = PROFILE_SERVER_BASE_URL or server
+    if not base_url or base_url == "0":
         raise RuntimeError("Login response did not include a profile server URL")
+    if not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url
+    request_url = base_url.rstrip("/") + "/" + endpoint.lstrip("/")
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(server+endpoint, data=data_enc, headers=headers)
-        resp.raise_for_status()
+        resp = await client.post(request_url, data=data_enc, headers=headers)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Player-info upstream HTTP {resp.status_code}: {resp.text[:300]}")
         return json.loads(json_format.MessageToJson(decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
 
 # === Caching Decorator ===
@@ -196,7 +204,8 @@ def health():
         "status": "ok",
         "release_version": RELEASEVERSION,
         "supported_regions": sorted(SUPPORTED_REGIONS),
-        "cached_regions": sorted(cached_tokens.keys())
+        "cached_regions": sorted(cached_tokens.keys()),
+        "profile_server_override": bool(PROFILE_SERVER_BASE_URL)
     }), 200
 
 @app.route('/player-info')
@@ -223,7 +232,12 @@ def get_account_info():
     except Exception as e:
         # Agar koi error aaye toh yeh catch karega
         app.logger.exception("Player-info request failed")
-        return jsonify({"error": "Player info request failed. Check UID, region, credentials, and upstream availability."}), 502
+        return jsonify({
+            "error": "Player info request failed.",
+            "details": str(e),
+            "uid": uid,
+            "region": region.upper()
+        }), 502
 
 @app.route('/refresh', methods=['GET','POST'])
 def refresh_tokens_endpoint():
